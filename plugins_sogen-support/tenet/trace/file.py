@@ -54,21 +54,23 @@ import collections
 #
 
 try:
-    from tenet.util.log import pmsg
-    from tenet.trace.arch import ArchAMD64, ArchX86
-    from tenet.trace.types import TraceMemory
-
-#
-# this script can technically be run in a standalone mone to process / digest
-# a trace outside of a disassembler / the normal integration. so if the above
-# fails, use the following imports to operate independently
-#
-
+        from tenet.util.log import pmsg
+        from tenet.util.rebase import rebase_database
+        from tenet.trace.arch import ArchAMD64, ArchX86
+        from tenet.trace.types import TraceMemory
+    
+    #
+    # this script can technically be run in a standalone mone to process / digest
+    # a trace outside of a disassembler / the normal integration. so if the above
+    # fails, use the following imports to operate independently
+    #
+    
 except ImportError:
-    from arch import ArchAMD64, ArchX86
-    from .types import TraceMemory 
-    pmsg = print
-
+        from arch import ArchAMD64, ArchX86
+        from .types import TraceMemory
+        # a little weird, but this makes 'rebase_database' a no-op outside IDA
+        rebase_database = lambda x: True
+        pmsg = print
 #-----------------------------------------------------------------------------
 # Definitions
 #-----------------------------------------------------------------------------
@@ -177,6 +179,7 @@ class TraceInfo(ctypes.Structure):
         ('mem_idx_width',   ctypes.c_uint8),
         ('mem_addr_width',  ctypes.c_uint8),
         ('original_hash',   ctypes.c_uint32),
+        ('module_base',     ctypes.c_uint64),
     ]
 
 class SegmentInfo(ctypes.Structure):
@@ -295,6 +298,9 @@ class TraceFile(object):
 
         # the hash of the original / source log file
         self.original_hash = None
+
+        # the module base as specified in the text trace
+        self.module_base = 0
 
         #
         # now that you have some idea of how the trace file is going to be
@@ -435,6 +441,7 @@ class TraceFile(object):
         header.mem_idx_width = width_from_type(self.mem_idx_type)
         header.mem_addr_width = width_from_type(self.mem_addr_type)
         header.original_hash = self.original_hash
+        header.module_base = self.module_base
         mask_data = (ctypes.c_uint32 * len(self.masks))(*self.masks)
 
         # save the global trace data / header to the zip
@@ -499,12 +506,15 @@ class TraceFile(object):
         """
         Load a packed trace from disk.
         """
-
         with zipfile.ZipFile(filepath, 'r') as zip_archive:
             self._load_header(zip_archive)
             self._load_segments(zip_archive)
 
         self.filepath = filepath
+
+        if self.module_base:
+            if not rebase_database(self.module_base):
+                pmsg("Database rebase failed or was cancelled.")
 
     def _select_arch(self, magic):
         """
@@ -563,6 +573,7 @@ class TraceFile(object):
 
             # source file hash
             self.original_hash = header.original_hash
+            self.module_base = header.module_base
 
     def _load_segments(self, zip_archive):
         """
@@ -591,7 +602,7 @@ class TraceFile(object):
         Load a text trace from disk.
         """
         idx = 0
-        
+
         # mappings of address/mask and their mapped (compressed) id
         # - NOTE: these are only used when converting traces from text to binary
         self.ip_map = collections.OrderedDict()
@@ -609,17 +620,45 @@ class TraceFile(object):
         # load / parse a text trace into trace segments
         with open(filepath, 'r') as f:
 
-            # loop until all of the lines in the file have been processed
-            while True:
+            #
+            # before processing a text trace, we will check the first line for a
+            # special 'mb=' (module base) tag. if this tag exists, we will use
+            # it to rebase the underlying database before continuing to parse
+            # and process the trace data
+            #
 
-                # select a chunk of N lines from the file
-                lines = itertools.islice(f, self.segment_length)
-                lines = list(lines)
+            #
+            # before processing a text trace, we will check the first line for a
+            # special 'mb=' (module base) tag. if this tag exists, we will use
+            # it to rebase the underlying database before continuing to parse
+            # and process the trace data
+            #
+
+            first_line = f.readline()
+            if first_line.startswith("mb="):
+                try:
+                    self.module_base = int(first_line.split("=")[1], 16)
+                    if not rebase_database(self.module_base):
+                        pmsg("Failed to rebase database, trace may not align correctly.")
+                except (ValueError, IndexError):
+                    pmsg("Failed to parse module base from trace file header.")
+                # The rest of the file is the actual trace content
+                remaining_lines = f.readlines()
+            else:
+                # The first line was not a rebase line, so we process it with the rest.
+                remaining_lines = [first_line] + f.readlines()
+
+            #
+            # now we process the trace lines in segments
+            #
+            
+            for i in range(0, len(remaining_lines), self.segment_length):
+                lines = remaining_lines[i:i+self.segment_length]
                 if not lines:
                     break
 
                 segment_id = len(self.segments)
-
+                
                 # create a new trace segment from the given lines of text
                 segment = TraceSegment(self, segment_id, idx)
                 segment.from_lines(lines)
@@ -627,7 +666,6 @@ class TraceFile(object):
 
                 # save the segment
                 self.segments.append(segment)
-                #break # for debugging...
 
         self._finalize()
         self._save()
